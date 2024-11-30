@@ -2,6 +2,7 @@
 using MicroRabbit.Domain.Core.Bus;
 using MicroRabbit.Domain.Core.Commands;
 using MicroRabbit.Domain.Core.Events;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using Newtonsoft.Json;
 using RabbitMQ.Client;
@@ -16,13 +17,15 @@ namespace MicroRabbit.Infra.Bus
         private readonly IMediator _mediator;
         private readonly Dictionary<string, List<Type>> _handlers;
         private readonly List<Type> _eventType;
+        private readonly IServiceScopeFactory _serviceScopeFactory;
 
-        public RabbitMQBus(IMediator mediator, IOptions<RabbitMQSettings> settings)
+        public RabbitMQBus(IMediator mediator, IOptions<RabbitMQSettings> settings, IServiceScopeFactory serviceScopeFactory)
         {
             _mediator = mediator;
             _handlers = new Dictionary<string, List<Type>>();
             _eventType = new List<Type>();
             _settings = settings.Value;
+            _serviceScopeFactory = serviceScopeFactory;
         }
 
         public void Publish<T>(T @event) where T : Event
@@ -53,31 +56,34 @@ namespace MicroRabbit.Infra.Bus
         }
 
         public void Subscribe<T, TH>()
-            where T : Event
-            where TH : IEventHandler<T>
+                    where T : Event
+                    where TH : IEventHandler<T>
         {
             var eventName = typeof(T).Name;
             var handlerType = typeof(TH);
 
-            if (_eventType.Contains(typeof(T)))
+            // Registrar el tipo de evento si no está en la lista
+            if (!_eventType.Contains(typeof(T)))
             {
                 _eventType.Add(typeof(T));
             }
 
+            // Registrar el handler para el evento si no está ya registrado
             if (!_handlers.ContainsKey(eventName))
             {
                 _handlers.Add(eventName, new List<Type>());
             }
 
-            if (_handlers[eventName].Any(s => s.GetType() == handlerType))
+            if (_handlers[eventName].Any(s => s == handlerType)) // Compara directamente el tipo
             {
-                throw new ArgumentException($"El handler exception {handlerType.Name} ya fue registrado anteriormente por {eventName}", nameof(handlerType));
+                throw new ArgumentException($"El handler {handlerType.Name} ya fue registrado anteriormente para {eventName}", nameof(handlerType));
             }
 
             _handlers[eventName].Add(handlerType);
 
             StartBasicConsume<T>();
         }
+
 
         private void StartBasicConsume<T>() where T : Event
         {
@@ -122,21 +128,26 @@ namespace MicroRabbit.Infra.Bus
         {
             if (_handlers.ContainsKey(eventName))
             {
-                var subscriptions = _handlers[eventName];
-
-                foreach (var subscription in subscriptions)
+                using (var scope = _serviceScopeFactory.CreateScope())
                 {
-                    var handler = Activator.CreateInstance(subscription);
-                    if (handler == null) continue;//mientras el handler sea null con el continue va saltar al foreach otra vez  
-                    var eventType = _eventType.SingleOrDefault(x => x.Name == eventName);
-                    if (eventType != null)
-                    {
-                        var @event = JsonConvert.DeserializeObject(message, eventType);
-                        var concreteType = typeof(IEventHandler<>).MakeGenericType(eventType);
+                    var subscriptions = _handlers[eventName];
 
-                        await (Task)concreteType.GetMethod("Handle")!.Invoke(handler, new object[] { @event! })!;
+                    foreach (var subscription in subscriptions)
+                    {
+                        var handler = scope.ServiceProvider.GetService(subscription); //Activator.CreateInstance(subscription);
+                        if (handler == null) continue;//mientras el handler sea null con el continue va saltar al foreach otra vez  
+                        var eventType = _eventType.SingleOrDefault(x => x.Name == eventName);
+                        if (eventType != null)
+                        {
+                            var @event = JsonConvert.DeserializeObject(message, eventType);
+                            var concreteType = typeof(IEventHandler<>).MakeGenericType(eventType);
+
+                            await (Task)concreteType.GetMethod("Handle")!.Invoke(handler, new object[] { @event! })!;
+                        }
                     }
                 }
+
+                
             }
         }
     }
